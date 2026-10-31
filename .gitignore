@@ -1,0 +1,17 @@
+# --- toolchains / build intermediates (not source) ---
+/sdk/
+/dl/
+/dl2/
+/bun-android/
+/bun-win/
+/out/
+/build/
+/buildtest/
+/seeded/
+/seedstage/
+/smoke/
+/src/
+*.log
+
+# --- installers are shipped as GitHub Release assets, not committed ---
+/dist/*.apk
