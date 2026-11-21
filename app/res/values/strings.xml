@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">magpie</string>
+    <string name="ch_service">Magpie 网关常驻</string>
+    <string name="ch_quota">额度与余额提醒</string>
+    <string name="ch_turn">任务完成提醒</string>
+    <string name="ch_mask">隐私脱敏告警</string>
+    <string name="ch_update">新版本更新</string>
+    <string name="sc_providers">Providers</string>
+    <string name="sc_plugins">Plugins</string>
+    <string name="sc_usage">Usage</string>
+    <string name="sc_gateway">Gateway</string>
+    <string name="sc_diag">Diagnostics</string>
 </resources>

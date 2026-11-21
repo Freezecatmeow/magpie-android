@@ -1,48 +1,63 @@
 package ai.usemagpie.android;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.View;
+import android.view.WindowInsets;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
-import android.webkit.WebViewClient;
+import android.widget.Toast;
 
-import org.json.JSONObject;
-
+import java.util.ArrayList;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 
-/**
- * magpie Android shell.
- *
- * Ships the headless magpie Go binary as lib/arm64-v8a/libmagpie.so. On start
- * it launches "magpie web --addr 127.0.0.1:3430 --no-open" with HOME pointed
- * at the app private dir and a fixed MAGPIE_WEB_KEY, then loads the web UI in
- * a WebView. The upstream binary serves its UI over http://127.0.0.1:3430
- * with a ?k=<key> login token.
- */
+/** Enhanced WebView host: Custom Tabs, SAF file chooser, dark bars, deep link, service binding. */
 public class MainActivity extends Activity {
     private static final String TAG = "Magpie";
-    private static final int PORT = 3430;
-    private static final String WEB_KEY = "magpie-android-local-key";
+    private static final int REQ_FILE = 1001;
+    private static final int REQ_CREATE_DOC = 1002;
+    public static volatile MainActivity INSTANCE;
 
-    private Process proc;
     private WebView web;
+    private ValueCallback<Uri[]> mFilePathCallback;
+    private String lastUrl;
+    private String pendingView;
+    private int insTop, insBottom, insLeft, insRight;
+    private boolean cssInjected = false;
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        applyEdgeToEdge();
+        INSTANCE = this;
+        NotificationHelper.ensureChannels(this);
+        requestNotificationPermission();
+        buildWebView();
+        startGatewayService();
+        handleIntent(getIntent(), false);
+        pollAndLoad();
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            try { requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 7001); } catch (Throwable ignored) {}
+        }
+    }
+
+    private void buildWebView() {
         web = new WebView(this);
-        web.setBackgroundColor(Color.WHITE);
+        web.setBackgroundColor(isNight() ? Color.parseColor("#101114") : Color.WHITE);
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -50,247 +65,256 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        web.setWebViewClient(new WebViewClient());
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
+        web.setWebViewClient(new MagpieWebViewClient(this));
+        web.setWebChromeClient(new MagpieWebChromeClient(this));
+        if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
         setContentView(web);
-
-        configureChinaMirror();
-        startServer();
-        seedOfflineOnce();
-        waitThenLoad();
+        applySystemBars(isNight() ? "#101114" : "#FFFFFF", !isNight());
+        cssInjected = false;
+        setupInsets();
     }
 
-    /**
-     * Draw the system bars in the page's own white instead of the default
-     * black, so the strip above the web UI is not a black band. The page is
-     * light, so the status/navigation icons go dark (LIGHT_* flags).
-     */
-    private void applyEdgeToEdge() {
-        try {
-            getWindow().setStatusBarColor(Color.WHITE);
-            int flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
-            if (Build.VERSION.SDK_INT >= 26) {
-                getWindow().setNavigationBarColor(Color.WHITE);
-                flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+    /** FR-17: capture status/nav/IME safe insets and expose them to the web layer as CSS variables. */
+    private void setupInsets() {
+        if (Build.VERSION.SDK_INT < 20 || web == null) return;
+        web.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+                insTop = insets.getSystemWindowInsetTop();
+                insBottom = insets.getSystemWindowInsetBottom();
+                insLeft = insets.getSystemWindowInsetLeft();
+                insRight = insets.getSystemWindowInsetRight();
+                applyInsetsCss();
+                return insets;
             }
+        });
+    }
+
+    private void applyInsetsCss() {
+        if (web == null) return;
+        String js = "try{var r=document.documentElement.style;"
+                + "r.setProperty('--magpie-safe-top','" + insTop + "px');"
+                + "r.setProperty('--magpie-safe-bottom','" + insBottom + "px');"
+                + "r.setProperty('--magpie-safe-left','" + insLeft + "px');"
+                + "r.setProperty('--magpie-safe-right','" + insRight + "px');}catch(e){}";
+        web.evaluateJavascript(js, null);
+    }
+
+    /** Called by MagpieWebViewClient.onPageFinished: inject android.css once + reapply insets. */
+    public void onPageFinished(String url) {
+        injectAndroidCss();
+        applyInsetsCss();
+    }
+
+    private void injectAndroidCss() {
+        if (web == null) return;
+        if (cssInjected) { applyInsetsCss(); return; }
+        try {
+            InputStream in = getAssets().open("android.css");
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] b = new byte[4096]; int n;
+            while ((n = in.read(b)) > 0) bos.write(b, 0, n);
+            in.close();
+            String css = new String(bos.toByteArray(), "UTF-8");
+            String js = "(function(){if(document.getElementById('magpie-android-css'))return;"
+                    + "var s=document.createElement('style');s.id='magpie-android-css';"
+                    + "s.textContent=" + org.json.JSONObject.quote(css) + ";"
+                    + "(document.head||document.documentElement).appendChild(s);})();";
+            web.evaluateJavascript(js, null);
+            cssInjected = true;
+        } catch (Throwable t) { Log.w(TAG, "inject css: " + t); }
+    }
+
+    private boolean isNight() {
+        int mode = getResources().getConfiguration().uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
+        return mode == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    private void startGatewayService() {
+        Intent svc = new Intent(this, MagpieGatewayService.class);
+        svc.setAction(MagpieGatewayService.ACTION_START);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc); else startService(svc);
+        } catch (Throwable t) { Log.e(TAG, "start service failed", t); }
+    }
+
+    private void pollAndLoad() {
+        final Handler h = new Handler(Looper.getMainLooper());
+        final int[] tries = {0};
+        h.postDelayed(new Runnable() {
+            public void run() {
+                if (MagpieAppState.running && MagpieAppState.webKey != null && MagpieAppState.webKey.length() > 0) {
+                    loadUi();
+                    return;
+                }
+                tries[0]++;
+                if (tries[0] < 240) h.postDelayed(this, 250);
+                else showError();
+            }
+        }, 250);
+    }
+
+    private void loadUi() {
+        String base = "http://127.0.0.1:" + MagpieAppState.port + "/?k=" + MagpieAppState.webKey;
+        if (pendingView != null) base += "&view=" + pendingView;
+        lastUrl = base;
+        web.loadUrl(base);
+    }
+
+    private void showError() {
+        web.loadData("<html><body style='font:16px sans-serif;padding:24px'>"
+                + "<h3>magpie 本地服务未就绪</h3><p>Go 服务未能在超时内监听 127.0.0.1:" + MagpieAppState.port + "。</p>"
+                + "</body></html>", "text/html", "utf-8");
+    }
+
+    /** Return true if we handled (consumed) the URL ourselves. */
+    public boolean handleUrl(String url) {
+        if (url == null) return false;
+        Uri u = Uri.parse(url);
+        String scheme = u.getScheme() == null ? "" : u.getScheme();
+        if ("magpie".equals(scheme)) { handleDeepLink(url); return true; }
+        String host = u.getHost();
+        if (host != null && (host.equals("127.0.0.1") || host.equals("localhost"))) return false;
+        if ("http".equals(scheme) || "https".equals(scheme)) { openExternal(url); return true; }
+        if ("about".equals(scheme) || "data".equals(scheme) || "blob".equals(scheme) || "javascript".equals(scheme)) return false;
+        openExternal(url);
+        return true;
+    }
+
+    /** Custom Tabs preferred, falls back to any browser. */
+    public void openExternal(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addCategory(Intent.CATEGORY_BROWSABLE);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            i.putExtra("android.support.customtabs.extra.EXTRA_ENABLE_INSTANT_APPS", true);
+            startActivity(i);
+        } catch (Throwable t) {
+            Toast.makeText(this, "无法打开外部链接", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    public void doCopy(String text) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null && text != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("magpie", text));
+                Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Throwable t) { Log.w(TAG, "copy: " + t); }
+    }
+
+    public void setTextZoom(int pct) {
+        try { if (web != null) web.getSettings().setTextZoom(pct); } catch (Throwable ignored) {}
+    }
+
+    public void applySystemBars(String colorHex, boolean lightIcons) {
+        try {
+            int color = Color.parseColor(colorHex);
+            getWindow().setStatusBarColor(color);
+            if (Build.VERSION.SDK_INT >= 26) getWindow().setNavigationBarColor(color);
+            int flags = 0;
+            if (Build.VERSION.SDK_INT >= 23) flags |= lightIcons ? View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR : 0;
+            if (Build.VERSION.SDK_INT >= 26) flags |= lightIcons ? View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0;
             getWindow().getDecorView().setSystemUiVisibility(flags);
-        } catch (Throwable t) {
-            Log.e(TAG, "applyEdgeToEdge failed", t);
-        }
+        } catch (Throwable t) { Log.w(TAG, "systemBars: " + t); }
     }
 
-    private void startServer() {
+    public boolean onShowFileChooser(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams params) {
+        if (mFilePathCallback != null) { try { mFilePathCallback.onReceiveValue(null); } catch (Throwable ignored) {} }
+        mFilePathCallback = cb;
         try {
-            String libDir = getApplicationInfo().nativeLibraryDir;
-            File bin = new File(libDir, "libmagpie.so");
-            ProcessBuilder pb = new ProcessBuilder(
-                    bin.getAbsolutePath(),
-                    "web",
-                    "--addr", "127.0.0.1:" + PORT,
-                    "--no-open");
-            pb.redirectErrorStream(true);
-            pb.directory(getFilesDir());
-            pb.environment().put("HOME", getFilesDir().getAbsolutePath());
-            pb.environment().put("TMPDIR", getCacheDir().getAbsolutePath());
-            pb.environment().put("MAGPIE_WEB_KEY", WEB_KEY);
-            File bunso = new File(libDir, "libbun.so");
-            bunso.setExecutable(true, false);
-            pb.environment().put("MAGPIE_BUN", bunso.getAbsolutePath());
-            String path = System.getenv("PATH");
-            pb.environment().put("PATH", libDir + ":" + (path == null ? "/system/bin" : path));
-            proc = pb.start();
-            Log.i(TAG, "magpie started from " + bin.getAbsolutePath());
-            final Process p = proc;
-            new Thread(new Runnable() {
-                public void run() {
-                    try {
-                        InputStream in = p.getInputStream();
-                        byte[] buf = new byte[4096];
-                        int n;
-                        while ((n = in.read(buf)) > 0) {
-                            Log.i(TAG, new String(buf, 0, n).trim());
-                        }
-                    } catch (Exception ignored) {
-                    }
-                }
-            }).start();
-        } catch (Exception e) {
-            Log.e(TAG, "failed to start magpie binary", e);
-        }
-    }
-
-    private boolean portUp() {
-        Socket so = new Socket();
-        try {
-            so.connect(new InetSocketAddress("127.0.0.1", PORT), 300);
+            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            String[] accept = params != null ? params.getAcceptTypes() : null;
+            if (accept != null) {
+                ArrayList<String> mimes = new ArrayList<String>();
+                for (String a : accept) if (a != null && a.length() > 0) mimes.add(a);
+                if (!mimes.isEmpty()) i.putExtra(Intent.EXTRA_MIME_TYPES, mimes.toArray(new String[0]));
+            }
+            startActivityForResult(Intent.createChooser(i, "选择文件"), REQ_FILE);
             return true;
-        } catch (Exception e) {
-            return false;
-        } finally {
-            try { so.close(); } catch (Exception ignored) {}
-        }
-    }
-
-    private void waitThenLoad() {
-        new Thread(new Runnable() {
-            public void run() {
-                boolean up = false;
-                for (int i = 0; i < 160; i++) {
-                    if (portUp()) { up = true; break; }
-                    try { Thread.sleep(250); } catch (InterruptedException ignored) {}
-                }
-                final boolean ok = up;
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        if (ok) {
-                            web.loadUrl("http://127.0.0.1:" + PORT + "/?k=" + WEB_KEY);
-                        } else {
-                            web.loadData(
-                                "<html><body style='font:16px sans-serif;padding:24px'>"
-                              + "<h3>magpie 本地服务未就绪</h3>"
-                              + "<p>Go 服务未能在超时内监听 127.0.0.1:" + PORT + "。</p>"
-                              + "</body></html>", "text/html", "utf-8");
-                        }
-                    }
-                });
-            }
-        }).start();
-    }
-
-    /**
-     * Point magpie's plugin marketplace at the China mirrors before the
-     * server starts.
-     *
-     * The in-app market resolves a plugin's latest version from npm at
-     * https://registry.npmjs.org. On a phone in China that lookup times out,
-     * so every community plugin (WorkBuddy, Qoder, ...) renders as
-     * "即将上线 / Coming soon" and cannot be installed. magpie already has a
-     * 「国内镜像」 switch (settings.chinaMirror) that asks npmmirror / jsDelivr
-     * first for the plugin list, the plugins and the Bun runtime; and a
-     * settings.npmRegistry that is asked for npm versions before the switch.
-     * This pre-seeds both so the mobile app works out of the box on a
-     * mainland network without the user flipping the switch by hand.
-     */
-    private void configureChinaMirror() {
-        try {
-            File cfgDir = new File(getFilesDir(), ".config/magpie");
-            if (!cfgDir.exists() && !cfgDir.mkdirs()) {
-                Log.w(TAG, "cannot create config dir " + cfgDir);
-            }
-            File sf = new File(cfgDir, "settings.json");
-            JSONObject o = new JSONObject();
-            if (sf.exists()) {
-                String txt = readFile(sf);
-                if (txt != null && txt.trim().length() > 0) {
-                    try { o = new JSONObject(txt); } catch (Exception ignored) { o = new JSONObject(); }
-                }
-            }
-            o.put("chinaMirror", true);
-            o.put("npmRegistry", "https://registry.npmmirror.com");
-            writeFile(sf, o.toString());
-            Log.i(TAG, "chinaMirror=true, npmRegistry=npmmirror -> " + sf.getAbsolutePath());
         } catch (Throwable t) {
-            Log.e(TAG, "configureChinaMirror failed", t);
+            mFilePathCallback = null;
+            return false;
         }
     }
 
-    private static String readFile(File f) throws Exception {
-        FileInputStream in = new FileInputStream(f);
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
-        in.close();
-        return new String(bos.toByteArray(), "UTF-8");
-    }
-
-    private static void writeFile(File f, String s) throws Exception {
-        FileOutputStream out = new FileOutputStream(f);
-        out.write(s.getBytes("UTF-8"));
-        out.close();
-    }
-
-    /**
-     * First-run OFFLINE seeding of the WorkBuddy and Qoder community plugins.
-     *
-     * The plugin project (plugins/ + plugins.json) was built on the build
-     * machine by the real CLI ("plugin add <pkg>") and shipped in
-     * assets/seed.zip; the Bun runtime ships as native library
-     * lib/arm64-v8a/libbun.so (Android 10+ refuses to exec a file written
-     * into app data, but nativeLibraryDir is executable, and magpie reads
-     * $MAGPIE_BUN). This unpacks seed.zip into the app home so magpie sees
-     * the plugins installed and needs no network to add them.
-     */
-    private void seedOfflineOnce() {
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    File marker = new File(getFilesDir(), ".magpie_offline_seeded_v2");
-                    if (marker.exists()) {
-                        Log.i(TAG, "offline seed: already done");
-                        return;
-                    }
-                    int n = unzipAsset("seed.zip", getFilesDir());
-                    marker.createNewFile();
-                    Log.i(TAG, "offline seed: unpacked " + n + " entries");
-                } catch (Throwable t) {
-                    Log.e(TAG, "offline seed error", t);
+    @Override protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_FILE) {
+            Uri[] result = null;
+            if (res == Activity.RESULT_OK && data != null) {
+                if (data.getClipData() != null) {
+                    ClipData cd = data.getClipData();
+                    result = new Uri[cd.getItemCount()];
+                    for (int k = 0; k < cd.getItemCount(); k++) result[k] = cd.getItemAt(k).getUri();
+                } else if (data.getData() != null) {
+                    result = new Uri[]{data.getData()};
                 }
             }
-        }).start();
-    }
-
-    /** Unzip an asset into destDir (creating parents); returns entry count. */
-    private int unzipAsset(String asset, File destDir) throws Exception {
-        java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(
-                new java.io.BufferedInputStream(getAssets().open(asset)));
-        byte[] buf = new byte[8192];
-        int count = 0;
-        java.util.zip.ZipEntry e;
-        while ((e = zin.getNextEntry()) != null) {
-            if (e.isDirectory()) {
-                continue;
-            }
-            File out = new File(destDir, e.getName());
-            File parent = out.getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
-            }
-            FileOutputStream fos = new FileOutputStream(out);
-            int len;
-            while ((len = zin.read(buf)) > 0) {
-                fos.write(buf, 0, len);
-            }
-            fos.close();
-            zin.closeEntry();
-            count++;
-        }
-        zin.close();
-        return count;
-    }
-
-    /**
-     * Back goes to the previous page in the web UI, not out of the app.
-     * magpie's SPA keeps its own history; only when the WebView has no page
-     * to return to does Back leave the app, as Android expects.
-     */
-    @Override
-    public void onBackPressed() {
-        if (web != null && web.canGoBack()) {
-            web.goBack();
-        } else {
-            super.onBackPressed();
+            if (mFilePathCallback != null) { mFilePathCallback.onReceiveValue(result); mFilePathCallback = null; }
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        if (proc != null) {
-            proc.destroy();
-            proc = null;
+    public void recoverWebView() {
+        try {
+            if (web != null) { web.destroy(); web = null; }
+            buildWebView();
+            if (lastUrl != null) web.loadUrl(lastUrl);
+        } catch (Throwable t) { Log.e(TAG, "recoverWebView", t); }
+    }
+
+    private void handleIntent(Intent intent, boolean onNew) {
+        if (intent == null) return;
+        if (intent.hasExtra("magpie.view")) pendingView = intent.getStringExtra("magpie.view");
+        if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
+            handleDeepLink(intent.getData().toString());
         }
+    }
+
+    public void handleDeepLink(String url) {
+        try {
+            Uri u = Uri.parse(url);
+            String importData = u.getQueryParameter("import");
+            if (importData != null) {
+                pendingView = "providers";
+                if (MagpieAppState.running && MagpieAppState.webKey.length() > 0) {
+                    String base = "http://127.0.0.1:" + MagpieAppState.port + "/?k=" + MagpieAppState.webKey
+                            + "&view=providers&import=" + Uri.encode(importData);
+                    if (web != null) web.loadUrl(base);
+                }
+            }
+        } catch (Throwable t) { Log.w(TAG, "deepLink: " + t); }
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent, true);
+        if (pendingView != null && MagpieAppState.running && web != null) loadUi();
+    }
+
+    /** Open the diagnostics center (used by launcher shortcut / future menu). */
+    public void openDiagnostics() {
+        try { startActivity(new Intent(this, DiagnosticsActivity.class)); } catch (Throwable t) { Log.w(TAG, "diag: " + t); }
+    }
+
+    @Override public void onBackPressed() {
         if (web != null) {
-            web.destroy();
+            web.evaluateJavascript(
+                "window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,which:27,bubbles:true}));",
+                null);
+            if (web.canGoBack()) { web.goBack(); return; }
         }
+        moveTaskToBack(true); // keep the gateway service alive
+    }
+
+    @Override protected void onDestroy() {
+        if (INSTANCE == this) INSTANCE = null;
+        if (web != null) { web.destroy(); web = null; }
         super.onDestroy();
     }
 }

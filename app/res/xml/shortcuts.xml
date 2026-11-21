@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:shortcutId="providers" android:enabled="true" android:icon="@mipmap/ic_launcher" android:shortcutShortLabel="@string/sc_providers">
+        <intent android:action="android.intent.action.MAIN" android:targetPackage="ai.usemagpie.android" android:targetClass="ai.usemagpie.android.MainActivity">
+            <extra android:name="magpie.view" android:value="providers"/>
+        </intent>
+    </shortcut>
+    <shortcut android:shortcutId="plugins" android:enabled="true" android:icon="@mipmap/ic_launcher" android:shortcutShortLabel="@string/sc_plugins">
+        <intent android:action="android.intent.action.MAIN" android:targetPackage="ai.usemagpie.android" android:targetClass="ai.usemagpie.android.MainActivity">
+            <extra android:name="magpie.view" android:value="plugins"/>
+        </intent>
+    </shortcut>
+    <shortcut android:shortcutId="usage" android:enabled="true" android:icon="@mipmap/ic_launcher" android:shortcutShortLabel="@string/sc_usage">
+        <intent android:action="android.intent.action.MAIN" android:targetPackage="ai.usemagpie.android" android:targetClass="ai.usemagpie.android.MainActivity">
+            <extra android:name="magpie.view" android:value="usage"/>
+        </intent>
+    </shortcut>
+    <shortcut android:shortcutId="gateway" android:enabled="true" android:icon="@mipmap/ic_launcher" android:shortcutShortLabel="@string/sc_gateway">
+        <intent android:action="android.intent.action.MAIN" android:targetPackage="ai.usemagpie.android" android:targetClass="ai.usemagpie.android.MainActivity">
+            <extra android:name="magpie.view" android:value="gateway"/>
+        </intent>
+    </shortcut>
+    <shortcut android:shortcutId="diagnostics" android:enabled="true" android:icon="@mipmap/ic_launcher" android:shortcutShortLabel="@string/sc_diag">
+        <intent android:action="android.intent.action.MAIN" android:targetPackage="ai.usemagpie.android" android:targetClass="ai.usemagpie.android.DiagnosticsActivity" />
+    </shortcut>
+</shortcuts>

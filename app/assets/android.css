@@ -1,0 +1,13 @@
+/* FR-17 host-side responsive patch, injected only inside the Android shell.
+   Safe, layout-only tweaks; no functional/DOM-breaking rules. */
+:root{--magpie-safe-top:0px;--magpie-safe-bottom:0px;--magpie-safe-left:0px;--magpie-safe-right:0px;}
+html,body{ -webkit-text-size-adjust:100%; overscroll-behavior-y:contain; }
+/* keep bottom safe area clear of the navigation bar */
+body{ padding-bottom:var(--magpie-safe-bottom) !important; }
+/* narrow screens (360dp–430dp): allow horizontal scroll for wide data tables instead of clipping */
+@media (max-width:430px){
+  table{ display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; max-width:100%; }
+  .modal,.dialog,[role="dialog"]{ max-width:calc(100vw - 16px) !important; max-height:calc(100vh - 32px) !important; }
+  pre,code{ white-space:pre; overflow-x:auto; }
+  button,.btn,[role="button"]{ min-height:36px; }
+}
